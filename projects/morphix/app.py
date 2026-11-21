@@ -1382,8 +1382,84 @@ def _build_ocr_heading_outline(blocks):
     )
 
 
-def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
+def get_pdf_split_bookmarks(path):
+    if fitz is None:
+        return []
+
+    doc = fitz.open(path)
+    try:
+        toc = doc.get_toc()
+        chapter_entries = [
+            (level, title, page)
+            for level, title, page in toc
+            if level <= 2 and re.match(r"^\s*chapter\s+\d+\b", title, re.I)
+        ]
+        if len(chapter_entries) < 2:
+            return []
+
+        landmarks = []
+        seen = set()
+        for level, title, page in toc:
+            if not isinstance(page, int) or not 1 <= page <= doc.page_count:
+                continue
+            title = re.sub(r"\s+", " ", title).strip()
+            is_chapter = (
+                level <= 2
+                and re.match(r"^\s*chapter\s+\d+\b", title, re.I)
+            )
+            is_part = level == 1 and re.match(r"^\s*part\b", title, re.I)
+            is_appendix = (
+                level <= 2
+                and re.match(r"^\s*(?:part\b.*append|append)", title, re.I)
+            )
+            is_backmatter = (
+                level == 1
+                and re.match(r"^\s*(?:index|references|bibliography)\b", title, re.I)
+            )
+            if not (is_chapter or is_part or is_appendix or is_backmatter):
+                continue
+            key = (page - 1, title.casefold())
+            if key not in seen:
+                chapter_match = re.match(r"^\s*chapter\s+(\d+)\b", title, re.I)
+                kind = (
+                    "chapter" if is_chapter
+                    else "part" if is_part
+                    else "backmatter"
+                )
+                landmarks.append({
+                    "page_index": page - 1,
+                    "title": title,
+                    "kind": kind,
+                    **({"number": int(chapter_match.group(1))} if chapter_match else {}),
+                })
+                seen.add(key)
+        return landmarks
+    finally:
+        doc.close()
+
+
+def build_pdf_bookmark_outline(path):
+    landmarks = get_pdf_split_bookmarks(path)
+    return "\n".join(
+        f"[{landmark['page_index']}] {landmark['title']}"
+        for landmark in landmarks
+    )
+
+
+def build_split_prompt(outline_text, unit_kind, total_units, ext=None, pdf_bookmarks=""):
     if ext == "pdf":
+        bookmark_guidance = ""
+        if pdf_bookmarks:
+            bookmark_guidance = (
+                "NATIVE PDF NAVIGATION LANDMARKS (zero-based physical page indices):\n"
+                f"{pdf_bookmarks}\n"
+                "Treat every listed Chapter bookmark as a required, separate chapter. "
+                "Use its page index as the chapter start, except when a Part bookmark "
+                "precedes the first chapter in that Part: start that chapter at the Part "
+                "bookmark's page so its title page stays with the chapter. A listed appendix "
+                "is a separate back-matter section. These are PDF bookmarks, not printed "
+                "page numbers from the contents.\n\n"
+            )
         return (
             f"The PDF has {total_units} physical pages indexed from 0. "
             "Split the book at chapter level so each chapter becomes its own standalone PDF.\n\n"
@@ -1418,7 +1494,8 @@ def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
             "- Do not invent content not present in the PDF.\n\n"
             "Use this page-indexed outline. The physical PDF page indices are authoritative "
             "even when printed page numbers differ.\n"
-            f"OUTLINE:\n{outline_text}"
+            f"{bookmark_guidance}"
+            f"PAGE OUTLINE:\n{outline_text}"
         )
 
     return (
@@ -1629,6 +1706,89 @@ def normalize_pdf_split_sections(chapters):
     return normalized
 
 
+def align_pdf_sections_to_bookmarks(chapters, bookmarks):
+    if not bookmarks:
+        return chapters
+
+    aligned = [dict(chapter) for chapter in chapters]
+    chapter_bookmarks = [
+        bookmark for bookmark in bookmarks if bookmark["kind"] == "chapter"
+    ]
+    chapter_starts = {
+        bookmark["number"]: bookmark["page_index"]
+        for bookmark in chapter_bookmarks
+    }
+    for part in (bookmark for bookmark in bookmarks if bookmark["kind"] == "part"):
+        following = next(
+            (
+                bookmark for bookmark in chapter_bookmarks
+                if bookmark["page_index"] > part["page_index"]
+            ),
+            None,
+        )
+        if following:
+            chapter_starts[following["number"]] = part["page_index"]
+
+    def chapter_number(title):
+        match = re.search(r"\bchapter\s+(\d+)\b", title, re.I)
+        return int(match.group(1)) if match else None
+
+    def chapter_title_key(title):
+        title = re.sub(r"^\s*chapter\s+\d+\s*[.:)]?\s*", "", title, flags=re.I)
+        return _normalized_boundary_text(title)
+
+    for bookmark in chapter_bookmarks:
+        candidates = [
+            chapter for chapter in aligned
+            if chapter_number(str(chapter.get("title", ""))) == bookmark["number"]
+        ]
+        if not candidates:
+            target_title = chapter_title_key(bookmark["title"])
+            candidates = [
+                chapter for chapter in aligned
+                if chapter_title_key(str(chapter.get("title", ""))) == target_title
+            ]
+        if candidates:
+            section = candidates[0]
+            section["start_unit"] = chapter_starts[bookmark["number"]]
+            section["kind"] = "chapter"
+        else:
+            aligned.append({
+                "title": bookmark["title"],
+                "kind": "chapter",
+                "start_unit": chapter_starts[bookmark["number"]],
+            })
+
+    for bookmark in bookmarks:
+        if bookmark["kind"] != "backmatter":
+            continue
+        title_key = _normalized_boundary_text(bookmark["title"])
+        match = next(
+            (
+                chapter for chapter in aligned
+                if _normalized_boundary_text(str(chapter.get("title", ""))) == title_key
+            ),
+            None,
+        )
+        if match:
+            match["start_unit"] = bookmark["page_index"]
+            match["kind"] = "backmatter"
+        else:
+            aligned.append({
+                "title": bookmark["title"],
+                "kind": "backmatter",
+                "start_unit": bookmark["page_index"],
+            })
+
+    by_start = {}
+    for chapter in aligned:
+        start = int(chapter["start_unit"])
+        existing = by_start.get(start)
+        if existing is None or chapter.get("kind") in {"chapter", "backmatter"}:
+            by_start[start] = chapter
+    return sorted(by_start.values(), key=lambda chapter: chapter["start_unit"])
+
+
 def chapters_to_ranges(chapters, total_units):
     total_units = max(0, int(total_units or 0))
     if total_units <= 0:
@@ -1741,7 +1901,18 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
         if rec["ext"] == "pdf" and any(block.get("ocr") for block in blocks)
         else ""
     )
-    outline_budget = max(1000, OUTLINE_MAX_CHARS - len(ocr_headings) - 64)
+    pdf_bookmark_landmarks = (
+        get_pdf_split_bookmarks(rec["abs_path"])
+        if rec["ext"] == "pdf"
+        else []
+    )
+    pdf_bookmarks = "\n".join(
+        f"[{landmark['page_index']}] {landmark['title']}"
+        for landmark in pdf_bookmark_landmarks
+    )
+    outline_budget = max(
+        1000, OUTLINE_MAX_CHARS - len(ocr_headings) - len(pdf_bookmarks) - 128
+    )
     outline_text, truncated = truncate_outline_lines(lines, outline_budget)
     if ocr_headings:
         outline_text = (
@@ -1749,7 +1920,9 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
             f"{ocr_headings}\n\nPAGE OUTLINE:\n{outline_text}"
         )
 
-    prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
+    prompt = build_split_prompt(
+        outline_text, unit_kind, total_units, rec["ext"], pdf_bookmarks
+    )
     _set_job(job_id, phase=f"asking {provider}", pct=30)
 
     # Both providers now get the text outline. This removes the multi-second
@@ -1773,6 +1946,7 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
     if rec["ext"] == "pdf":
         chapters = align_pdf_section_starts(chapters, prominence)
         chapters = normalize_pdf_split_sections(chapters)
+        chapters = align_pdf_sections_to_bookmarks(chapters, pdf_bookmark_landmarks)
 
     ranges = chapters_to_ranges(chapters, total_units)
     _set_job(job_id, phase="writing files", pct=80)

@@ -118,6 +118,85 @@ class SplitPromptTests(unittest.TestCase):
         self.assertIn("Do NOT group all chapters in a Part into one section", prompt)
         self.assertIn("Group continuation pages of the same front/back-matter item", prompt)
 
+    def test_pdf_split_prompt_uses_native_chapter_bookmarks_as_boundaries(self):
+        prompt = morphix.build_split_prompt(
+            "outline", "page", 5, "pdf",
+            "[2] Chapter 1. First\n[3] Part I Appendices\n[4] Chapter 2. Second",
+        )
+
+        self.assertIn("[2] Chapter 1. First", prompt)
+        self.assertIn("[3] Part I Appendices", prompt)
+        self.assertIn("every listed Chapter bookmark as a required", prompt)
+        self.assertIn("start that chapter at the Part bookmark's page", prompt)
+        self.assertIn("A listed appendix is a separate back-matter section", prompt)
+
+    def test_pdf_bookmark_outline_keeps_chapters_and_appendix_landmarks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "book.pdf"
+            document = fitz.open()
+            for _ in range(5):
+                document.new_page()
+            document.set_toc([
+                [1, "Cover", 1],
+                [1, "Part I. Introduction", 2],
+                [2, "Chapter 1. First", 3],
+                [3, "I. First subsection", 3],
+                [2, "Part I Appendices", 4],
+                [1, "Part II. Skills", 4],
+                [2, "Chapter 2. Second", 5],
+                [1, "Index", 5],
+            ])
+            document.save(path)
+            document.close()
+
+            outline = morphix.build_pdf_bookmark_outline(path)
+
+        self.assertEqual(outline.splitlines(), [
+            "[1] Part I. Introduction",
+            "[2] Chapter 1. First",
+            "[3] Part I Appendices",
+            "[3] Part II. Skills",
+            "[4] Chapter 2. Second",
+            "[4] Index",
+        ])
+
+    def test_pdf_bookmark_outline_is_omitted_without_multiple_chapters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "book.pdf"
+            document = fitz.open()
+            document.new_page()
+            document.set_toc([[1, "Chapter 1. First", 1]])
+            document.save(path)
+            document.close()
+
+            outline = morphix.build_pdf_bookmark_outline(path)
+
+        self.assertEqual(outline, "")
+
+    def test_pdf_bookmarks_repair_chapter_starts_and_add_missing_appendices(self):
+        chapters = [
+            {"title": "Front matter", "kind": "frontmatter", "start_unit": 0},
+            {"title": "Chapter 1. First", "kind": "chapter", "start_unit": 4},
+            {"title": "Chapter 6. Sixth", "kind": "chapter", "start_unit": 10},
+            {"title": "Index", "kind": "backmatter", "start_unit": 30},
+        ]
+        bookmarks = [
+            {"title": "Part I. Introduction", "kind": "part", "page_index": 1},
+            {"title": "Chapter 1. First", "kind": "chapter", "number": 1, "page_index": 2},
+            {"title": "Part I Appendices", "kind": "backmatter", "page_index": 10},
+            {"title": "Part II. Skills", "kind": "part", "page_index": 14},
+            {"title": "Chapter 6. Sixth", "kind": "chapter", "number": 6, "page_index": 15},
+            {"title": "Index", "kind": "backmatter", "page_index": 30},
+        ]
+
+        aligned = morphix.align_pdf_sections_to_bookmarks(chapters, bookmarks)
+        starts = {chapter["title"]: chapter["start_unit"] for chapter in aligned}
+
+        self.assertEqual(starts["Chapter 1. First"], 1)
+        self.assertEqual(starts["Part I Appendices"], 10)
+        self.assertEqual(starts["Chapter 6. Sixth"], 14)
+        self.assertEqual(starts["Index"], 30)
+
     def test_outline_keeps_numbered_chapter_and_appendix_titles(self):
         title = "3“I Didn’t Mean for It to Happen”"
         blocks = [
