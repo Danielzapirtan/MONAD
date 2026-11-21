@@ -116,6 +116,9 @@ class SplitPromptTests(unittest.TestCase):
 
         self.assertIn("Each numbered chapter must be its own section", prompt)
         self.assertIn("Do NOT group all chapters in a Part into one section", prompt)
+        self.assertIn("Romanian 'CAPITOLUL'", prompt)
+        self.assertIn("a number without the word 'Chapter'", prompt)
+        self.assertIn("Formulae, equations, chart labels, and diagram labels are not sections", prompt)
         self.assertIn("Group continuation pages of the same front/back-matter item", prompt)
 
     def test_pdf_split_prompt_uses_native_chapter_bookmarks_as_boundaries(self):
@@ -172,6 +175,64 @@ class SplitPromptTests(unittest.TestCase):
             outline = morphix.build_pdf_bookmark_outline(path)
 
         self.assertEqual(outline, "")
+
+    def test_pdf_blocks_are_rebuilt_when_ocr_language_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "book.pdf"
+            source.touch()
+            cache_path = Path(str(source) + ".blocks.json")
+            cache_path.write_text(json.dumps({
+                "version": morphix.BLOCK_CACHE_VERSION,
+                "ocr_language": "eng",
+                "blocks": [{"type": "para", "text": "old OCR"}],
+                "prominence": {},
+            }), encoding="utf-8")
+            rec = {"abs_path": str(source), "ext": "pdf"}
+
+            with (
+                patch.object(morphix, "PDF_OCR_LANGUAGE", "ron+eng"),
+                patch.object(
+                    morphix, "_extract_blocks_with_prominence",
+                    return_value=([{"type": "para", "text": "new OCR"}], {}),
+                ) as extract,
+            ):
+                blocks, _ = morphix.get_blocks(rec)
+
+        self.assertEqual(blocks, [{"type": "para", "text": "new OCR"}])
+        extract.assert_called_once_with(str(source), "pdf")
+
+    def test_numeric_chapter_bookmarks_without_chapter_word_are_kept(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "book.pdf"
+            document = fitz.open()
+            for _ in range(3):
+                document.new_page()
+            document.set_toc([
+                [1, "Contents", 1],
+                [2, "1 - Reinforcement: Better than Rewards", 2],
+                [3, "What Is a Positive Reinforcer?", 2],
+                [2, "2 - Shaping: Developing Super Performance", 3],
+            ])
+            document.save(path)
+            document.close()
+
+            bookmarks = morphix.get_pdf_split_bookmarks(path)
+            aligned = morphix.align_pdf_sections_to_bookmarks(
+                [{"title": "Reinforcement: Better than Rewards", "start_unit": 4}],
+                bookmarks,
+            )
+
+        self.assertEqual(
+            [(bookmark["number"], bookmark["page_index"]) for bookmark in bookmarks],
+            [(1, 1), (2, 2)],
+        )
+        self.assertEqual(
+            [(chapter["title"], chapter["start_unit"]) for chapter in aligned],
+            [
+                ("Reinforcement: Better than Rewards", 1),
+                ("2 - Shaping: Developing Super Performance", 2),
+            ],
+        )
 
     def test_pdf_bookmarks_repair_chapter_starts_and_add_missing_appendices(self):
         chapters = [
@@ -324,6 +385,20 @@ class SplitPromptTests(unittest.TestCase):
                 ("1. Chapter One", 5),
                 ("2. Chapter Two", 10),
             ],
+        )
+
+    def test_pdf_split_normalization_drops_formula_only_sections(self):
+        chapters = [
+            {"title": "First Chapter", "kind": "chapter", "start_unit": 0},
+            {"title": "VP=1Dx", "kind": "chapter", "start_unit": 52},
+            {"title": "Second Chapter", "kind": "chapter", "start_unit": 53},
+        ]
+
+        normalized = morphix.normalize_pdf_split_sections(chapters)
+
+        self.assertEqual(
+            [(chapter["title"], chapter["start_unit"]) for chapter in normalized],
+            [("First Chapter", 0), ("Second Chapter", 53)],
         )
 
     def test_truncated_outline_preserves_dense_opening_and_closing_sections(self):

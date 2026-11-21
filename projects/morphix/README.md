@@ -35,7 +35,8 @@ Two dependencies are optional-but-recommended:
   OCR is used only on image pages with sparse text; when smart split outputs
   PDF files, it keeps the original pages and their layout.
   Set `MORPHIX_OCR_LANGUAGE` to installed Tesseract languages joined with `+`
-  (for example, `ron+eng` for Romanian and English scans); the default is `eng`.
+  (for example, `eng` for English-only scans); the default is `ron+eng` for
+  the Romanian and English books in `books/`.
 - **EbookLib** — required for any EPUB support (reading, writing, splitting).
   There is no fallback for EPUB.
 

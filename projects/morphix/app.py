@@ -135,7 +135,7 @@ PDF_SPLIT_RESPONSE_SCHEMA = {
     },
     "required": ["sections"],
 }
-PDF_OCR_LANGUAGE = os.environ.get("MORPHIX_OCR_LANGUAGE", "eng").strip() or "eng"
+PDF_OCR_LANGUAGE = os.environ.get("MORPHIX_OCR_LANGUAGE", "ron+eng").strip() or "ron+eng"
 ENV_KEYS = {
     "claude": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -390,7 +390,7 @@ threading.Thread(target=cleanup_loop, daemon=True).start()
 # needed. Cache the result next to the source so repeated operations are fast.
 # Cache files are session-scoped and removed by cleanup_loop.
 # ---------------------------------------------------------------------------
-BLOCK_CACHE_VERSION = 2
+BLOCK_CACHE_VERSION = 3
 
 
 def _cache_path(rec):
@@ -405,11 +405,15 @@ def get_blocks(rec):
     It powers align_pdf_section_starts() without reopening the PDF.
     """
     cache = _cache_path(rec)
+    ocr_language = PDF_OCR_LANGUAGE if rec["ext"].lower() == "pdf" else None
     if os.path.exists(cache):
         try:
             with open(cache, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("version") == BLOCK_CACHE_VERSION:
+            if (
+                data.get("version") == BLOCK_CACHE_VERSION
+                and data.get("ocr_language") == ocr_language
+            ):
                 return data.get("blocks", []), data.get("prominence", {})
         except Exception:
             # Corrupt cache: fall through and rebuild.
@@ -420,6 +424,7 @@ def get_blocks(rec):
         with open(cache, "w", encoding="utf-8") as f:
             json.dump({
                 "version": BLOCK_CACHE_VERSION,
+                "ocr_language": ocr_language,
                 "blocks": blocks,
                 "prominence": prominence,
             }, f)
@@ -1382,6 +1387,13 @@ def _build_ocr_heading_outline(blocks):
     )
 
 
+def _pdf_chapter_bookmark_number(title):
+    match = re.match(r"^\s*chapter\s+(\d+)\b", title, re.I)
+    if not match:
+        match = re.match(r"^\s*(\d{1,2})\s*[-–—.:)]\s+\S", title)
+    return int(match.group(1)) if match else None
+
+
 def get_pdf_split_bookmarks(path):
     if fitz is None:
         return []
@@ -1392,7 +1404,7 @@ def get_pdf_split_bookmarks(path):
         chapter_entries = [
             (level, title, page)
             for level, title, page in toc
-            if level <= 2 and re.match(r"^\s*chapter\s+\d+\b", title, re.I)
+            if level <= 2 and _pdf_chapter_bookmark_number(title) is not None
         ]
         if len(chapter_entries) < 2:
             return []
@@ -1403,10 +1415,10 @@ def get_pdf_split_bookmarks(path):
             if not isinstance(page, int) or not 1 <= page <= doc.page_count:
                 continue
             title = re.sub(r"\s+", " ", title).strip()
-            is_chapter = (
-                level <= 2
-                and re.match(r"^\s*chapter\s+\d+\b", title, re.I)
+            chapter_number = (
+                _pdf_chapter_bookmark_number(title) if level <= 2 else None
             )
+            is_chapter = chapter_number is not None
             is_part = level == 1 and re.match(r"^\s*part\b", title, re.I)
             is_appendix = (
                 level <= 2
@@ -1420,7 +1432,6 @@ def get_pdf_split_bookmarks(path):
                 continue
             key = (page - 1, title.casefold())
             if key not in seen:
-                chapter_match = re.match(r"^\s*chapter\s+(\d+)\b", title, re.I)
                 kind = (
                     "chapter" if is_chapter
                     else "part" if is_part
@@ -1430,7 +1441,7 @@ def get_pdf_split_bookmarks(path):
                     "page_index": page - 1,
                     "title": title,
                     "kind": kind,
-                    **({"number": int(chapter_match.group(1))} if chapter_match else {}),
+                    **({"number": chapter_number} if is_chapter else {}),
                 })
                 seen.add(key)
         return landmarks
@@ -1453,7 +1464,8 @@ def build_split_prompt(outline_text, unit_kind, total_units, ext=None, pdf_bookm
             bookmark_guidance = (
                 "NATIVE PDF NAVIGATION LANDMARKS (zero-based physical page indices):\n"
                 f"{pdf_bookmarks}\n"
-                "Treat every listed Chapter bookmark as a required, separate chapter. "
+                "Treat every listed Chapter bookmark as a required, separate chapter, "
+                "including numbered chapter titles that do not literally say 'Chapter'. "
                 "Use its page index as the chapter start, except when a Part bookmark "
                 "precedes the first chapter in that Part: start that chapter at the Part "
                 "bookmark's page so its title page stays with the chapter. A listed appendix "
@@ -1468,6 +1480,9 @@ def build_split_prompt(outline_text, unit_kind, total_units, ext=None, pdf_bookm
             "several chapters are grouped under a Part heading. Do NOT group all chapters in a "
             "Part into one section. If a Part heading immediately precedes its first chapter, "
             "include that Part page with that chapter rather than creating a separate Part file. "
+            "Chapter markers may be localized (for example, Romanian 'CAPITOLUL') or may be "
+            "a number without the word 'Chapter'; treat each such top-level chapter separately. "
+            "Formulae, equations, chart labels, and diagram labels are not sections. "
             "Do not split on subheadings, running headers, or entries that appear only in the "
             "table of contents. For proper chapters, use the chapter NUMBER shown in the document "
             "(not a running index).\n\n"
@@ -1650,10 +1665,20 @@ def align_pdf_section_starts(chapters, prominence):
     return aligned
 
 
+def _is_pdf_formula_title(title):
+    compact = re.sub(r"\s+", "", str(title))
+    return (
+        len(compact) <= 40
+        and bool(re.fullmatch(r"[A-Z0-9]+(?:[=<>≤≥±×÷*/^+][A-Z0-9]+)+", compact, re.I))
+    )
+
+
 def normalize_pdf_split_sections(chapters):
     normalized = []
     for chapter in chapters:
         title = str(chapter.get("title", "")).strip()
+        if _is_pdf_formula_title(title):
+            continue
         if _normalized_boundary_text(title) in {
             "blankpage",
             "thispageintentionallyleftblank",
@@ -1730,11 +1755,11 @@ def align_pdf_sections_to_bookmarks(chapters, bookmarks):
             chapter_starts[following["number"]] = part["page_index"]
 
     def chapter_number(title):
-        match = re.search(r"\bchapter\s+(\d+)\b", title, re.I)
-        return int(match.group(1)) if match else None
+        return _pdf_chapter_bookmark_number(title)
 
     def chapter_title_key(title):
         title = re.sub(r"^\s*chapter\s+\d+\s*[.:)]?\s*", "", title, flags=re.I)
+        title = re.sub(r"^\s*\d{1,2}\s*[-–—.:)]\s*", "", title)
         return _normalized_boundary_text(title)
 
     for bookmark in chapter_bookmarks:
